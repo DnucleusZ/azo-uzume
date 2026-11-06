@@ -1,48 +1,75 @@
-name: CI
+name: Windows ASIO software checks
 
 on:
-  # `push` checks the branch itself, `pull_request` checks the merge result.
   push:
   pull_request:
+  workflow_dispatch:
 
-# A second push to a branch cancels the run still going for the first one.
+permissions:
+  contents: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
+  group: asio-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  clippy:
-    # ASIO is Windows-only, and the build script runs `windows-bindgen`
-    runs-on: windows-latest
+  software:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, undocumented]
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+      RUSTUP_TOOLCHAIN: 1.98.1
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
     steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: clippy
-
-      - name: Clippy (default features)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Clippy (all features)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      # Without `--workspace` the features of `azo-sys` are only whatever `azo`
-      # forwards to it, which is what a dependent crate gets.
-      - name: Clippy (`azo` on its own)
-        run: cargo clippy --package azo --all-targets --all-features -- -D warnings
-
-  publish-dry-run:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # `--workspace` verifies `azo` against the locally packaged `azo-sys`,
-      # rather than the version already on crates.io.
-      - name: Publish dry-run
-        run: cargo publish --dry-run --workspace
+          persist-credentials: false
+      - name: Prepare fixed toolchain and dependencies
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
+          rustc -Vv
+          cargo fetch --locked
+      - name: Formatting and strict static checks
+        env:
+          FEATURE_SET: ${{ matrix.features }}
+        run: |
+          cargo fmt --all --check
+          args=()
+          if [ "$FEATURE_SET" = undocumented ]; then args=(--features undocumented); fi
+          cargo clippy --workspace --all-targets --locked --offline "${args[@]}" -- -D warnings
+      - name: Build software tests
+        env:
+          FEATURE_SET: ${{ matrix.features }}
+        run: |
+          args=()
+          if [ "$FEATURE_SET" = undocumented ]; then args=(--features undocumented); fi
+          cargo test --workspace --no-run --locked --offline "${args[@]}"
+      - name: Run software tests with bounded supervision
+        env:
+          FEATURE_SET: ${{ matrix.features }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          command = ['cargo', 'test', '--workspace', '--locked', '--offline']
+          if os.environ['FEATURE_SET'] == 'undocumented':
+              command += ['--features', 'undocumented']
+          process = subprocess.Popen(command)
+          try:
+              result = process.wait(timeout=60)
+          except subprocess.TimeoutExpired:
+              subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], check=False)
+              process.wait()
+              raise
+          if result:
+              raise SystemExit(result)
+          print('Software checks only. External SDK tests remain explicitly ignored; no device was opened.')
+          PY

@@ -1,72 +1,67 @@
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
-use std::num::NonZeroI32;
-use azo_sys::ResultCode;
-use crate::{Error, WinResult};
+use std::ptr;
+use std::rc::Rc;
+
 use windows_core::{GUID, Interface};
-use crate::win::*;
 
-/// Same as [`Interface::cast`], except that the target interface's IID is decoupled from its type.
-pub unsafe fn cast_decoupled<Target: Interface>(interface: &impl Interface, target_iid: *const GUID) -> windows_core::Result<Target> {
-    let mut out = None;
-    unsafe { interface.query(target_iid, (&raw mut out).cast()) }.ok()?;
-    out.ok_or_else(|| E_POINTER.into())
-}
+use crate::win::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize, E_POINTER};
+use crate::{Error, Result, WinResult, sys};
 
-/// Somehow [`CString`] has no equivalent of [`CStr::from_bytes_until_nul`] - <https://github.com/rust-lang/rust/pull/96186>
-#[must_use]
-pub fn cstring_from_bytes_until_nul(buffer: &[u8]) -> CString {
-    CStr
-    ::from_bytes_until_nul(buffer)
-    .expect("buffer overflow")
-    .to_owned()
-}
-
-pub trait ResultCodeExt {
-    /// Cannot use [`From`] / [`Into`] because of the orphan rule
-    fn to_result(self) -> crate::Result<()>;
-    fn to_result_with<T>(self, ok_fn: impl FnOnce() -> T) -> crate::Result<T>;
-}
-
-impl ResultCodeExt for ResultCode {
-    fn to_result(self) -> crate::Result<()> {
-        match self {
-            Self::OK |
-            Self::SUCCESS => Ok(()),
-            
-            bad_code => Err(Error(unsafe { NonZeroI32::new_unchecked(bad_code.0) }))
-        }
+/// Query an interface whose IID is provided by its driver rather than its Rust type.
+///
+/// # Safety
+/// `target_iid` must identify `Target` on this object. The returned interface must
+/// remain in its initialized COM apartment and obey its threading contract.
+pub(crate) unsafe fn cast_decoupled<Target: Interface>(
+    interface: &impl Interface,
+    target_iid: &GUID,
+) -> WinResult<Target> {
+    let mut raw = ptr::null_mut();
+    unsafe { interface.query(target_iid, &raw mut raw) }.ok()?;
+    if raw.is_null() {
+        return Err(E_POINTER.into());
     }
-    
-    fn to_result_with<T>(self, ok_fn: impl FnOnce() -> T) -> crate::Result<T> {
-        self.to_result().map(|()| ok_fn())
-    }
+    Ok(unsafe { Target::from_raw(raw) })
 }
 
-type PhantomUnSend = PhantomData<*const ()>;
+pub(crate) fn parse_string(field: &'static str, bytes: &[u8]) -> Result<CString> {
+    CStr::from_bytes_until_nul(bytes)
+        .map(CStr::to_owned)
+        .map_err(|_| Error::UnterminatedString { field })
+}
 
-/// Ensures correct pairing of COM init/uninit
-#[derive(Debug, PartialEq, Eq)]
-pub struct COMInit(PhantomUnSend);
+pub(crate) fn parse_bool(field: &'static str, value: sys::Bool) -> Result<bool> {
+    bool::try_from(value).map_err(|_| Error::InvalidBoolean {
+        field,
+        value: value.0,
+    })
+}
+
+pub(crate) fn check_code(operation: &'static str, code: sys::ResultCode) -> Result<()> {
+    code.ok(())
+        .map_err(|code| Error::Driver { operation, code })
+}
+
+pub(crate) fn check_future_code(code: sys::ResultCode) -> Result<()> {
+    code.future_ok(()).map_err(|code| Error::Driver {
+        operation: "future",
+        code,
+    })
+}
+
+/// One successful STA initialization; deliberately neither cloneable nor sendable.
+pub(crate) struct COMInit(PhantomData<Rc<()>>);
 
 impl COMInit {
-    pub fn new() -> WinResult<Self> {
-        // STA because most ASIO drivers do not support MTA
-        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED as _) }
-        .map(|| Self(PhantomUnSend::default()))
-    }
-}
-
-impl Clone for COMInit {
-    fn clone(&self) -> Self {
-        // The existence of `self` guarantees that this thread is already STA initialized,
-        // so re-initializing simply increments the ref count.
-        Self::new().expect("COM STA re-initialization should be infallible")
+    pub(crate) fn new() -> WinResult<Self> {
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED as _) }.ok()?;
+        Ok(Self(PhantomData))
     }
 }
 
 impl Drop for COMInit {
     fn drop(&mut self) {
-        unsafe { CoUninitialize(); }
+        unsafe { CoUninitialize() };
     }
 }
