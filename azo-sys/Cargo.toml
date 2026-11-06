@@ -1,9 +1,10 @@
 [package]
 name = "azo-sys"
 description = "ffi types for azo"
-publish = true
-version = "0.3.2"
+publish = false
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true

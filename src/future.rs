@@ -2,55 +2,67 @@ use crate::sys::*;
 
 /// This has nothing to do with [`std::future::Future`], ASIO just unfortunately happens to have a concept of the same name.
 /// In their defense, ASIO pre-dates widespread adoption of the async concurrency model.
-#[expect(clippy::module_name_repetitions, reason = "prefix added because std's Future is in the prelude")]
-pub trait AsioFuture {
-	const SELECTOR: FutureSelector;
-	type Param;
+///
+/// Only the I/O format operations below are available through the safe API.
+/// The trait is sealed so a caller cannot pair a selector with incompatible storage:
+///
+/// ```compile_fail
+/// use azo::{future::AsioFuture, sys::FutureSelector};
+/// struct WrongStorage;
+/// impl AsioFuture for WrongStorage {
+///     const SELECTOR: FutureSelector = FutureSelector::GET_IO_FORMAT;
+///     const MUTATES_CONFIGURATION: bool = false;
+///     type Param = ();
+/// }
+/// ```
+///
+/// A supported operation also requires its fixed parameter type:
+///
+/// ```compile_fail
+/// use azo::future::{AsioFuture, GetIoFormat};
+/// fn request<T: AsioFuture>(_: &mut T::Param) {}
+/// request::<GetIoFormat>(&mut ());
+/// ```
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "prefix added because std's Future is in the prelude"
+)]
+pub trait AsioFuture: sealed::Sealed {
+    const SELECTOR: FutureSelector;
+    /// Whether the operation changes the driver's configuration.
+    /// The owner must check its configuration state before issuing such a call.
+    const MUTATES_CONFIGURATION: bool;
+    type Param;
+}
+
+mod sealed {
+    pub trait Sealed {}
 }
 
 macro_rules! Impl {
-	($($name:ident, $selector:ident, $param:ty),+) => {
+	($($name:ident, $selector:ident, $mutates:literal),+) => {
 		$(
 			#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 			pub struct $name;
-			
+			impl sealed::Sealed for $name {}
+
 			impl AsioFuture for $name {
 				const SELECTOR: FutureSelector = FutureSelector::$selector;
-				type Param = $param;
+				const MUTATES_CONFIGURATION: bool = $mutates;
+				type Param = IoFormat;
 			}
 		)+
 	}
 }
 
 Impl!(
-	EnableTimeCodeRead , ENABLE_TIME_CODE_READ , (),
-	DisableTimeCodeRead, DISABLE_TIME_CODE_READ, (),
-	SetInputMonitor    , SET_INPUT_MONITOR     , InputMonitor,
-	
-	CanInputMonitor, CAN_INPUT_MONITOR, (),
-	CanTimeInfo    , CAN_TIME_INFO    , (),
-	CanTimeCode    , CAN_TIME_CODE    , (),
-	
-	SetIoFormat  , SET_IO_FORMAT   , IoFormat,
-	GetIoFormat  , GET_IO_FORMAT   , IoFormat,
-	CanDoIoFormat, CAN_DO_IO_FORMAT, IoFormat,
-	
-	CanReportOverload       , CAN_REPORT_OVERLOAD        , (),
-	GetInternalBufferSamples, GET_INTERNAL_BUFFER_SAMPLES, InternalBufferInfo
-);
-
-#[cfg(feature = "undocumented")]
-Impl!(
-	Transport      ,  TRANSPORT       , TransportParameters,
-	SetInputGain   ,  SET_INPUT_GAIN  , ChannelControls,
-	GetInputMeter  ,  GET_INPUT_METER , ChannelControls,
-	SetOutputGain  ,  SET_OUTPUT_GAIN , ChannelControls,
-	GetOutputMeter ,  GET_OUTPUT_METER, ChannelControls,
-
-	CanTransport   , CAN_TRANSPORT   , (),
-	CanInputGain   , CAN_INPUT_GAIN  , (),
-	CanInputMeter  , CAN_INPUT_METER , (),
-	CanOutputGain  , CAN_OUTPUT_GAIN , (),
-	CanOutputMeter , CAN_OUTPUT_METER, (),
-	OptionalOne    , OPTIONAL_ONE    , ()
+    GetIoFormat,
+    GET_IO_FORMAT,
+    false,
+    CanDoIoFormat,
+    CAN_DO_IO_FORMAT,
+    false,
+    SetIoFormat,
+    SET_IO_FORMAT,
+    true
 );
